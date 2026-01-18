@@ -1,17 +1,12 @@
 import scrapy
-import json
+import os
 from datetime import datetime, timedelta
-from pathlib import Path
 from scrapy.crawler import CrawlerProcess
 from scrapy.http import FormRequest
 from bs4 import BeautifulSoup
 from nepali.datetime import nepalidate
-from ..config import OUTPUT_DIR, CONCURRENT_REQUESTS, DOWNLOAD_TIMEOUT
+from ..config import FILES_STORE, DEFAULT_SETTINGS
 from ..utils import normalize_whitespace, normalize_date, nepali_to_roman_numerals, fix_parenthesis_spacing, parse_judges
-
-SPECIAL_COURT_DIR = OUTPUT_DIR / "court-cases" / "specialcourt"
-JOBDIR = SPECIAL_COURT_DIR / ".scrapy_state"
-CHECKPOINT_FILE = SPECIAL_COURT_DIR / ".checkpoint.json"
 
 
 class SpecialCourtCasesSpider(scrapy.Spider):
@@ -19,46 +14,92 @@ class SpecialCourtCasesSpider(scrapy.Spider):
     base_url = "https://supremecourt.gov.np/special/syspublic.php?d=reports&f=daily_public"
     
     custom_settings = {
-        "CONCURRENT_REQUESTS": CONCURRENT_REQUESTS,
-        "DOWNLOAD_TIMEOUT": DOWNLOAD_TIMEOUT,
-        "USER_AGENT": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        "JOBDIR": str(JOBDIR),  # Enable Scrapy's built-in checkpointing
+        **DEFAULT_SETTINGS,
+        "FEEDS": {
+            os.path.join(FILES_STORE, "supreme-court/special-court-cases/cases.jsonl"): {
+                "format": "jsonlines",
+                "encoding": "utf-8",
+                "overwrite": False,
+            }
+        },
     }
     
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self.processed_dates = self.load_checkpoint()
-    
-    def load_checkpoint(self):
-        """Load set of already processed dates"""
-        if CHECKPOINT_FILE.exists():
-            with open(CHECKPOINT_FILE, 'r', encoding='utf-8') as f:
-                data = json.load(f)
-                return set(data.get('processed_dates', []))
-        return set()
-    
-    def save_checkpoint(self, date_str):
-        """Save a processed date to checkpoint"""
-        self.processed_dates.add(date_str)
-        CHECKPOINT_FILE.parent.mkdir(parents=True, exist_ok=True)
-        with open(CHECKPOINT_FILE, 'w', encoding='utf-8') as f:
-            json.dump({
-                'processed_dates': sorted(list(self.processed_dates)),
-                'last_updated': datetime.now().isoformat()
-            }, f, ensure_ascii=False, indent=2)
+        # Track processed dates in memory during this run to avoid duplicate R1 requests
+        self.processed_dates_this_run = set()
+        # Load dates that have already been scraped
+        self.processed_dates = self.load_processed_dates()
+
+    def load_processed_dates(self):
+        """
+        Load dates that have already been scraped from the JSONL file.
+        Returns a set of date_ad strings that have been fully processed.
+        Works for both local and S3/R2 storage.
+        """
+        processed = set()
+        jsonl_path = os.path.join(FILES_STORE, "supreme-court/special-court-cases/cases.jsonl")
+        
+        try:
+            # For S3/R2 storage, we need to use boto3 to read the file
+            if FILES_STORE.startswith('s3://'):
+                try:
+                    import boto3
+                    import io
+                    import json
+                    
+                    # Parse S3 path
+                    s3_path = jsonl_path.replace('s3://', '')
+                    bucket_name = s3_path.split('/')[0]
+                    key = '/'.join(s3_path.split('/')[1:])
+                    
+                    # Get S3 client
+                    s3_client = boto3.client('s3')
+                    
+                    # Download and read the file
+                    response = s3_client.get_object(Bucket=bucket_name, Key=key)
+                    content = response['Body'].read().decode('utf-8')
+                    
+                    # Parse JSONL and extract dates
+                    for line in content.split('\n'):
+                        if line.strip():
+                            case = json.loads(line)
+                            processed.add(case.get('date_ad'))
+                    
+                    self.logger.info(f"Loaded {len(processed)} processed dates from S3")
+                    
+                except Exception as e:
+                    self.logger.warning(f"Could not load from S3 (file may not exist yet): {e}")
+            
+            # For local storage
+            else:
+                if os.path.exists(jsonl_path):
+                    import json
+                    with open(jsonl_path, 'r', encoding='utf-8') as f:
+                        for line in f:
+                            if line.strip():
+                                case = json.loads(line)
+                                processed.add(case.get('date_ad'))
+                    
+                    self.logger.info(f"Loaded {len(processed)} processed dates from local storage")
+                else:
+                    self.logger.info("No existing data file found, starting fresh")
+        
+        except Exception as e:
+            self.logger.warning(f"Error loading processed dates: {e}")
+        
+        return processed
 
     def start_requests(self):
         """Generate requests for the past 5 years, going backwards from today"""
-        end_date = datetime.now().date() - timedelta(days=2) # 2 days ago
+        end_date = datetime.now().date() - timedelta(days=2)  # 2 days ago
         start_date = end_date - timedelta(days=5*365)  # 5 years ago
-
-        # start_date = end_date - timedelta(days=) # TODO: For debuging purposes
         
         current_date = end_date
         while current_date >= start_date:
             date_str = current_date.isoformat()
             
-            # Skip if already processed
+            # Skip if this date has already been processed
             if date_str in self.processed_dates:
                 self.logger.debug(f"Skipping already processed date: {date_str}")
                 current_date -= timedelta(days=1)
@@ -73,7 +114,7 @@ class SpecialCourtCasesSpider(scrapy.Spider):
                 
                 self.logger.info(f"Processing date: {date_str} -> BS {syy}/{smm}/{sdd}")
                 
-                # First request to get bench types
+                # R1: First request to get bench types for this date
                 yield FormRequest(
                     url=self.base_url,
                     formdata={
@@ -97,7 +138,7 @@ class SpecialCourtCasesSpider(scrapy.Spider):
             current_date -= timedelta(days=1)
 
     def parse_bench_types(self, response):
-        """Parse the bench types from the first response"""
+        """Parse the bench types from R1 response and checkpoint on date"""
         soup = BeautifulSoup(response.text, 'html.parser')
         
         date_ad = response.meta['date_ad']
@@ -105,13 +146,18 @@ class SpecialCourtCasesSpider(scrapy.Spider):
         smm = response.meta['smm']
         sdd = response.meta['sdd']
         
+        # Mark this date as processed for this run
+        if date_ad in self.processed_dates_this_run:
+            self.logger.debug(f"Date {date_ad} already processed in this run, skipping")
+            return
+        
+        self.processed_dates_this_run.add(date_ad)
+        
         # Find the bench_type select element
         bench_select = soup.find('select', {'name': 'bench_type'})
         
         if not bench_select:
             self.logger.info(f"No bench types found for date {date_ad} (BS {syy}/{smm}/{sdd})")
-            # Mark date as processed even if no benches found
-            self.save_checkpoint(date_ad)
             return
         
         # Extract bench type options with both value and label
@@ -130,7 +176,7 @@ class SpecialCourtCasesSpider(scrapy.Spider):
         yo_input = soup.find('input', {'name': 'yo', 'type': 'hidden'})
         yo_value = yo_input.get('value', '1') if yo_input else '1'
         
-        # Request each bench type
+        # R2: Request each bench type
         for bench in benches:
             yield FormRequest(
                 url=self.base_url,
@@ -153,12 +199,9 @@ class SpecialCourtCasesSpider(scrapy.Spider):
                 },
                 dont_filter=True
             )
-        
-        # Mark date as processed after all bench requests are queued
-        self.save_checkpoint(date_ad)
 
     def parse_cases(self, response):
-        """Parse the case details from the bench response"""
+        """Parse the case details from R2 bench response and yield items for feed export"""
         soup = BeautifulSoup(response.text, 'html.parser')
         
         date_ad = response.meta['date_ad']
@@ -208,6 +251,7 @@ class SpecialCourtCasesSpider(scrapy.Spider):
         # Parse table rows
         rows = case_table.find_all('tr')[1:]  # Skip header row
         
+        cases_found = 0
         for row in rows:
             cells = row.find_all('td')
             
@@ -237,8 +281,9 @@ class SpecialCourtCasesSpider(scrapy.Spider):
             # Normalize bench_label spacing
             bench_label_normalized = normalize_whitespace(bench_label)
             
-            # Create case data structure
-            case_data = {
+            # Yield case data for feed export
+            cases_found += 1
+            yield {
                 'case_number': case_number,
                 'date_ad': date_ad,
                 'date_bs': f"{syy}-{smm}-{sdd}",
@@ -259,44 +304,11 @@ class SpecialCourtCasesSpider(scrapy.Spider):
                 'footer': footer_text,
                 'scraped_at': datetime.now().isoformat()
             }
-            
-            # Save case to file
-            self.save_case(case_data)
-
-    def save_case(self, case_data):
-        """Save case data to JSON file organized by registration date and case number"""
-        case_number = case_data['case_number']
-        date_bs = case_data['date_bs'].replace('/', '-')  # e.g., "2082-09-02"
-        registration_date = case_data['registration_date']  # e.g., "2082-04-23"
         
-        # Use registration date for directory organization
-        # If registration_date is empty, use "unknown"
-        reg_date_dir = registration_date if registration_date else "unknown"
-        
-        # Sanitize case number for directory name
-        case_dir_name = case_number.replace('/', '-').replace('\\', '-')
-        
-        # Organize as: specialcourt/<reg-date>/<case-number>/activity/<date>.json
-        case_dir = SPECIAL_COURT_DIR / reg_date_dir / case_dir_name / "activity"
-        filepath = case_dir / f"{date_bs}.json"
-        
-        # Skip if file already exists (avoid re-scraping)
-        if filepath.exists():
-            self.logger.debug(f"Case {case_number} for date {date_bs} already exists, skipping")
-            return
-        
-        # Create directory if it doesn't exist
-        filepath.parent.mkdir(parents=True, exist_ok=True)
-        
-        # Save to file
-        with open(filepath, 'w', encoding='utf-8') as f:
-            json.dump(case_data, f, ensure_ascii=False, indent=2)
-        
-        self.logger.info(f"Saved case: {case_number} for date {date_bs} to {filepath}")
+        self.logger.info(f"Yielded {cases_found} cases for bench {bench_type} on {date_ad}")
 
 
 if __name__ == "__main__":
-    SPECIAL_COURT_DIR.mkdir(parents=True, exist_ok=True)
     process = CrawlerProcess({"LOG_LEVEL": "INFO"})
     process.crawl(SpecialCourtCasesSpider)
     process.start()
