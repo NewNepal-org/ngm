@@ -45,7 +45,7 @@ class DistrictCourtCasesSpider(scrapy.Spider):
         end_date = now_ktm.date() - timedelta(days=SCRAPE_OFFSET_DAYS)
         start_date = end_date - timedelta(days=SCRAPE_LOOKBACK_DAYS)
 
-        for court in DISTRICT_COURTS[30:31]:
+        for court in DISTRICT_COURTS:
             code_name = court['code_name']
             district_id = court['district_id']
             district_name = court['district']
