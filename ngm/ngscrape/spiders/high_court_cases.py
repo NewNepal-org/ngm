@@ -1,55 +1,36 @@
+"""
+High Court Cases Scraper
+
+Scrapes daily case lists (cause lists) from all 18 high courts in Nepal.
+URL pattern: https://supremecourt.gov.np/court/{court_id}/bench_list?pesi_date={date}
+"""
+
 import scrapy
-import json
 import re
 from datetime import datetime, timedelta
-from pathlib import Path
-from scrapy.crawler import CrawlerProcess
+from typing import List, Tuple
 from scrapy.http import FormRequest
 from bs4 import BeautifulSoup
 from nepali.datetime import nepalidate
-from ngm.ngscrape.settings import CONCURRENT_REQUESTS, DOWNLOAD_TIMEOUT, FILES_STORE
+import pytz
 from ngm.utils.normalizer import (
     normalize_whitespace,
     normalize_date,
     nepali_to_roman_numerals,
-    fix_parenthesis_spacing
+    fix_parenthesis_spacing,
 )
+from ngm.utils.court_ids import HIGH_COURTS
+from ngm.database.models import get_engine, get_session, init_db, CourtCase, CourtCaseHearing
+from ngm.utils.db_helpers import get_scraped_dates, mark_date_scraped, convert_bs_to_ad, CaseCache
+from ngm.ngscrape.constants import SCRAPE_LOOKBACK_DAYS, SCRAPE_OFFSET_DAYS
 
-OUTPUT_DIR = Path(FILES_STORE) if isinstance(FILES_STORE, str) else Path(FILES_STORE)
-HIGH_COURT_DIR = OUTPUT_DIR / "court-cases" / "highcourts"
-CHECKPOINT_FILE = HIGH_COURT_DIR / ".checkpoint.json"
-
-# High courts in Nepal
-HIGH_COURTS = [
-    "biratnagarhc",
-    "illamhc",
-    "dhankutahc",
-    "okhaldhungahc",
-    "janakpurhc",
-    "rajbirajhc",
-    "birganjhc",
-    "patanhc",
-    "hetaudahc",
-    "pokharahc",
-    "baglunghc",
-    "tulsipurhc",
-    "butwalhc",
-    "nepalgunjhc",
-    "surkhethc",
-    "jumlahc",
-    "dipayalhc",
-    "mahendranagarhc"
-]
-
-
-HIGH_COURTS = ["rajbirajhc"]
+KATHMANDU_TZ = pytz.timezone('Asia/Kathmandu')
 
 
 class HighCourtCasesSpider(scrapy.Spider):
     name = "high_court_cases"
     
     custom_settings = {
-        # Retry configuration
         "CONCURRENT_REQUESTS": 2,
         "RETRY_ENABLED": True,
         "RETRY_TIMES": 3,
@@ -59,126 +40,82 @@ class HighCourtCasesSpider(scrapy.Spider):
     
     def __init__(self, court=None, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        # Allow filtering by specific court
-        if court:
-            self.courts = [court] if court in HIGH_COURTS else HIGH_COURTS
+        self.engine = get_engine()
+        init_db(self.engine)
+        self.session = get_session(self.engine)
+        self.case_cache = CaseCache()
+        
+        court_identifiers = [c['identifier'] for c in HIGH_COURTS]
+        if court and court in court_identifiers:
+            self.courts = [court]
         else:
-            self.courts = HIGH_COURTS
+            self.courts = court_identifiers
         
-        self.processed_dates = self.load_checkpoint()
-    
-    def load_checkpoint(self):
-        """Load set of already processed dates per court"""
-        if CHECKPOINT_FILE.exists():
-            with open(CHECKPOINT_FILE, 'r', encoding='utf-8') as f:
-                data = json.load(f)
-                return data.get('processed_dates', {})
-        return {}
-    
-    def save_checkpoint(self, court, date_str):
-        """Save a processed date to checkpoint for specific court"""
-        if court not in self.processed_dates:
-            self.processed_dates[court] = []
-        
-        if date_str not in self.processed_dates[court]:
-            self.processed_dates[court].append(date_str)
-        
-        CHECKPOINT_FILE.parent.mkdir(parents=True, exist_ok=True)
-        with open(CHECKPOINT_FILE, 'w', encoding='utf-8') as f:
-            json.dump({
-                'processed_dates': self.processed_dates,
-                'last_updated': datetime.now().isoformat()
-            }, f, ensure_ascii=False, indent=2)
+        self._bench_counter = {}
+        self._data_by_date = {}
 
     def start_requests(self):
-        """Generate requests for all high courts for the past 5 years"""
-        end_date = datetime.now().date() - timedelta(days=2)  # 2 days ago
-        start_date = end_date - timedelta(days=5*365)  # 5 years ago
+        now_ktm = datetime.now(KATHMANDU_TZ)
+        end_date = now_ktm.date() - timedelta(days=SCRAPE_OFFSET_DAYS)
+        start_date = end_date - timedelta(days=SCRAPE_LOOKBACK_DAYS)
         
-        for court in self.courts:
+        for court_id in self.courts:
+            scraped_dates = get_scraped_dates(self.session, court_id)
+            
+            self.logger.info(f"Starting scrape for {court_id}, {len(scraped_dates)} dates already processed")
+            
             current_date = end_date
             while current_date >= start_date:
-                date_str = current_date.isoformat()
-                
-                # Skip if already processed for this court
-                court_processed = self.processed_dates.get(court, [])
-                if date_str in court_processed:
-                    self.logger.debug(f"Skipping already processed date: {court} - {date_str}")
-                    current_date -= timedelta(days=1)
-                    continue
-                
-                # Convert to Nepali date
                 try:
                     nepali_date = nepalidate.from_date(current_date)
+                    date_bs = f"{nepali_date.year:04d}-{nepali_date.month:02d}-{nepali_date.day:02d}"
+                    
+                    if date_bs in scraped_dates:
+                        self.logger.debug(f"Skipping {court_id} {date_bs} (already processed)")
+                        current_date -= timedelta(days=1)
+                        continue
+                    
                     pesi_date = f"{nepali_date.year:04d}%2F{nepali_date.month:02d}%2F{nepali_date.day:02d}"
                     
-                    self.logger.info(f"Processing {court} - date: {date_str} -> BS {nepali_date.year}/{nepali_date.month:02d}/{nepali_date.day:02d}")
+                    self.logger.info(f"Processing {court_id} - date: {date_bs}")
                     
-                    # R1: First request to get bench list for this date
                     yield scrapy.Request(
-                        url=f"https://supremecourt.gov.np/court/{court}/bench_list?pesi_date={pesi_date}",
+                        url=f"https://supremecourt.gov.np/court/{court_id}/bench_list?pesi_date={pesi_date}",
                         callback=self.parse_bench_list,
                         meta={
-                            'court': court,
-                            'date_ad': date_str,
-                            'nepali_year': nepali_date.year,
-                            'nepali_month': nepali_date.month,
-                            'nepali_day': nepali_date.day,
+                            'court_id': court_id,
+                            'date_bs': date_bs,
                             'hearing_date': f"{nepali_date.year:04d}{nepali_date.month:02d}{nepali_date.day:02d}"
                         },
                         dont_filter=True
                     )
                 except Exception as e:
-                    self.logger.error(f"Error converting date {date_str} for {court}: {e}")
+                    self.logger.error(f"Error converting date {current_date} for {court_id}: {e}")
                 
                 current_date -= timedelta(days=1)
 
     def parse_bench_list(self, response):
-        """Parse the bench list from R1 response"""
         soup = BeautifulSoup(response.text, 'html.parser')
         
-        court = response.meta['court']
-        date_ad = response.meta['date_ad']
+        court_id = response.meta['court_id']
+        date_bs = response.meta['date_bs']
         hearing_date = response.meta['hearing_date']
         
-        # Check if request was blocked by WAF
         if "The requested URL was rejected" in response.text or "support ID is:" in response.text:
-            self.logger.error(f"Request blocked by WAF for {court} - {date_ad}. Try reducing CONCURRENT_REQUESTS or increasing DOWNLOAD_DELAY.")
+            self.logger.error(f"Request blocked by WAF for {court_id} - {date_bs}")
             return
         
-        # Debug: Log the response to see what we're getting
-        self.logger.debug(f"Response URL: {response.url}")
-        self.logger.debug(f"Response status: {response.status}")
-        
-        # Debug: Save HTML response for inspection
-        debug_dir = HIGH_COURT_DIR / "debug"
-        debug_dir.mkdir(parents=True, exist_ok=True)
-        debug_file = debug_dir / f"{court}_{date_ad}_bench_list.html"
-        with open(debug_file, 'w', encoding='utf-8') as f:
-            f.write(response.text)
-        self.logger.info(f"Saved debug HTML to {debug_file}")
-        
-        # Find the bench list table
         bench_table = soup.find('table', class_='table table-striped table-bordered table-hover')
         
         if not bench_table:
-            # Debug: Try to find any tables
-            all_tables = soup.find_all('table')
-            self.logger.debug(f"Found {len(all_tables)} tables total")
-            if all_tables:
-                for idx, table in enumerate(all_tables):
-                    self.logger.debug(f"Table {idx} classes: {table.get('class', [])}")
-            
-            self.logger.info(f"No bench list found for {court} - {date_ad}")
-            self.save_checkpoint(court, date_ad)
+            self.logger.info(f"No bench list found for {court_id} - {date_bs}")
+            self._save_cases_and_hearings([], court_id, date_bs, 0)
             return
         
-        # Extract bench information from table rows
         rows = bench_table.find('tbody').find_all('tr') if bench_table.find('tbody') else []
         
         benches = []
         for row in rows:
-            # Skip summary rows (जम्माः)
             if 'जम्माः' in row.get_text():
                 continue
             
@@ -186,19 +123,13 @@ class HighCourtCasesSpider(scrapy.Spider):
             if len(cells) < 2:
                 continue
             
-            # Extract bench_no and bench_id from onclick attribute
             onclick = row.get('onclick', '')
             if 'send_data' in onclick:
-                # Parse: send_data('260823', '२', '20820904')
-                import re
                 match = re.search(r"send_data\('(\d+)',\s*'([^']+)',\s*'(\d+)'\)", onclick)
                 if match:
                     bench_id = match.group(1)
                     bench_no = match.group(2)
-                    
-                    # Extract judge name
-                    judge_cell = cells[1] if len(cells) > 1 else None
-                    judge_name = normalize_whitespace(judge_cell.get_text()) if judge_cell else ""
+                    judge_name = normalize_whitespace(cells[1].get_text()) if len(cells) > 1 else ""
                     
                     benches.append({
                         'bench_id': bench_id,
@@ -207,16 +138,15 @@ class HighCourtCasesSpider(scrapy.Spider):
                     })
         
         if not benches:
-            self.logger.info(f"No benches found for {court} - {date_ad}")
-            self.save_checkpoint(court, date_ad)
+            self.logger.info(f"No benches found for {court_id} - {date_bs}")
+            self._save_cases_and_hearings([], court_id, date_bs, 0)
             return
         
-        self.logger.info(f"Found {len(benches)} benches for {court} - {date_ad}")
+        self.logger.info(f"Found {len(benches)} benches for {court_id} - {date_bs}")
         
-        # R2: Request each bench's cause list
         for bench in benches:
             yield FormRequest(
-                url=f"https://supremecourt.gov.np/court/{court}/cause_list_detail",
+                url=f"https://supremecourt.gov.np/court/{court_id}/cause_list_detail",
                 formdata={
                     'bench_id': bench['bench_id'],
                     'bench_no': bench['bench_no'],
@@ -224,161 +154,40 @@ class HighCourtCasesSpider(scrapy.Spider):
                 },
                 callback=self.parse_cases,
                 meta={
-                    'court': court,
-                    'date_ad': date_ad,
-                    'nepali_year': response.meta['nepali_year'],
-                    'nepali_month': response.meta['nepali_month'],
-                    'nepali_day': response.meta['nepali_day'],
+                    'court_id': court_id,
+                    'date_bs': date_bs,
                     'bench_id': bench['bench_id'],
                     'bench_no': bench['bench_no'],
-                    'judge_name': bench['judge_name']
+                    'judge_name': bench['judge_name'],
+                    'total_benches': len(benches)
                 },
                 dont_filter=True
             )
-        
-        # Mark date as processed after all benches are requested
-        self.save_checkpoint(court, date_ad)
 
     def _clean_case_number(self, case_number_cell):
-        """
-        Clean case number by extracting only the main case number.
-        Handles <br> tags and removes parenthetical information.
-        
-        Examples:
-        - "082-AP-0023<br>" -> "082-AP-0023"
-        - "081-WO-0257 ( सरल मार्ग )" -> "081-WO-0257"
-        """
-        # Replace <br> tags with space before extracting text
         for br in case_number_cell.find_all('br'):
             br.replace_with(' ')
-        
         case_number = normalize_whitespace(case_number_cell.get_text())
-        
-        # Remove anything in parentheses (including the parentheses)
-        import re
         cleaned = re.sub(r'\s*\([^)]*\)\s*', '', case_number)
         return cleaned.strip()
-    
-    def _parse_judges(self, judge_text):
-        """
-        Parse judge names into a list.
-        Handles multiple judges separated by 'मा. न्या. श्री' prefix.
-        
-        Example:
-        "मा. न्या. श्री महेन्द्रनाथ उपाध्यायमा. न्या. श्री नारायण प्रसाद रेग्मी"
-        -> ["मा. न्या. श्री महेन्द्रनाथ उपाध्याय", "मा. न्या. श्री नारायण प्रसाद रेग्मी"]
-        """
-        if not judge_text:
-            return []
-        
-        # Split by the judge prefix pattern
-        import re
-        # Split on 'मा. न्या. श्री' or 'मा.न्या.श्री' but keep the prefix
-        parts = re.split(r'(मा\.?\s*न्या\.?\s*श्री)', judge_text)
-        
-        judges = []
-        current_judge = ""
-        
-        for part in parts:
-            if re.match(r'मा\.?\s*न्या\.?\s*श्री', part):
-                # This is a prefix
-                if current_judge:
-                    judges.append(normalize_whitespace(current_judge))
-                current_judge = part
-            else:
-                # This is a name
-                current_judge += part
-        
-        # Add the last judge
-        if current_judge:
-            judges.append(normalize_whitespace(current_judge))
-        
-        return judges
-    
-    def _parse_lawyers(self, lawyers_text):
-        """
-        Parse lawyers field. Returns None if empty or '--'.
-        Splits by '||' if present for plaintiff and defendant lawyers.
-        """
-        lawyers_text = normalize_whitespace(lawyers_text)
-        
-        if not lawyers_text or lawyers_text == '--':
-            return None
-        
-        # Check if there are separate lawyers for plaintiff and defendant
-        if '||' in lawyers_text:
-            parts = lawyers_text.split('||', 1)
-            return {
-                'plaintiff_lawyers': normalize_whitespace(parts[0]),
-                'defendant_lawyers': normalize_whitespace(parts[1])
-            }
-        
-        return lawyers_text
 
-    def parse_cases(self, response):
-        """Parse the case details from R2 bench response"""
-        soup = BeautifulSoup(response.text, 'html.parser')
+    def _extract_case_data(self, rows, court_id, date_bs, bench_id, bench_no, bench_type, judge_name) -> List[Tuple[CourtCase, CourtCaseHearing]]:
+        data: List[Tuple[CourtCase, CourtCaseHearing]] = []
         
-        court = response.meta['court']
-        date_ad = response.meta['date_ad']
-        nepali_year = response.meta['nepali_year']
-        nepali_month = response.meta['nepali_month']
-        nepali_day = response.meta['nepali_day']
-        bench_id = response.meta['bench_id']
-        bench_no = response.meta['bench_no']
-        judge_name = response.meta['judge_name']
-        
-        date_bs = f"{nepali_year:04d}-{nepali_month:02d}-{nepali_day:02d}"
-        
-        # Convert bench_no to Roman numerals
         bench_no_roman = nepali_to_roman_numerals(bench_no)
         
-        # Parse judges into a list
-        judges_list = self._parse_judges(judge_name)
-        
-        # Extract court name from header
-        court_name_elem = soup.find('h3')
-        court_name = normalize_whitespace(court_name_elem.get_text()) if court_name_elem else ""
-        
-        # Extract bench type (एकल इजलास, संयुक्त इजलास, etc.)
-        bench_type_elem = soup.find('h4', string=lambda x: x and 'इजलास' in x)
-        bench_type = normalize_whitespace(bench_type_elem.get_text()) if bench_type_elem else ""
-        
-        # Extract footer (इजलास अधिकृत info)
-        footer_rows = soup.find_all('h5')
-        footer_text = " | ".join([normalize_whitespace(elem.get_text()) for elem in footer_rows])
-        
-        # Find the case table
-        case_table = soup.find('table', class_='table table-bordered table-hover')
-        
-        if not case_table:
-            self.logger.warning(f"No case table found for {court} - bench {bench_no} on {date_ad}")
-            return
-        
-        # Parse table rows (skip header)
-        rows = case_table.find('tbody').find_all('tr', class_='data_row') if case_table.find('tbody') else []
-        
-        if not rows:
-            self.logger.info(f"No cases found for {court} - bench {bench_no} on {date_ad}")
-            return
-        
-        cases_found = 0
         for row in rows:
             cells = row.find_all('td')
             
             if len(cells) < 9:
                 continue
             
-            # Extract case data and normalize whitespace
             serial_no = nepali_to_roman_numerals(normalize_whitespace(cells[0].get_text()))
             division = normalize_whitespace(cells[1].get_text())
             registration_date = normalize_date(normalize_whitespace(cells[2].get_text()))
             case_type = normalize_whitespace(cells[3].get_text())
-            
-            # Clean case number (remove parenthetical info and handle <br> tags)
             case_number = self._clean_case_number(cells[4])
             
-            # Parse parties (पक्ष || विपक्ष)
             parties = normalize_whitespace(cells[5].get_text())
             plaintiff = ""
             defendant = ""
@@ -389,91 +198,118 @@ class HighCourtCasesSpider(scrapy.Spider):
             else:
                 plaintiff = parties
             
-            # Lawyers (का. व्य. नाम) - parse and handle empty/-- values
-            lawyers = self._parse_lawyers(cells[6].get_text())
+            lawyers_text = normalize_whitespace(cells[6].get_text())
+            lawyer_names = None if not lawyers_text or lawyers_text == '--' else lawyers_text
             
-            # Remarks (कैफियत)
             remarks = normalize_whitespace(cells[7].get_text())
             
-            # Status (स्थिती)
             status_cell = cells[8]
-            # Extract text preserving line breaks
             for br in status_cell.find_all('br'):
                 br.replace_with('\n')
             status = normalize_whitespace(status_cell.get_text())
             
-            # Skip if no case number
             if not case_number:
                 continue
             
-            # Create case data structure
-            case_data = {
-                'case_number': case_number,
-                'court': court,
-                'court_name': court_name,
-                'date_ad': date_ad,
-                'date_bs': date_bs,
-                'bench_id': bench_id,
-                'bench_no': bench_no_roman,
-                'bench_type': bench_type,
-                'judges': judges_list,
-                'serial_no': serial_no,
-                'division': division,
-                'registration_date': registration_date,
-                'case_type': case_type,
-                'plaintiff': plaintiff,
-                'defendant': defendant,
-                'lawyers': lawyers,
-                'remarks': remarks,
-                'status': status,
-                'footer': footer_text,
-                'scraped_at': datetime.now().isoformat()
-            }
+            case = self.case_cache.get(case_number, court_id)
+            if not case:
+                case = CourtCase(
+                    case_number=case_number,
+                    court_identifier=court_id,
+                    registration_date_bs=registration_date,
+                    registration_date_ad=convert_bs_to_ad(registration_date),
+                    case_type=case_type,
+                    division=division,
+                    plaintiff=plaintiff,
+                    defendant=defendant
+                )
+                self.case_cache.set(case)
             
-            # Save case to file
-            self.save_case(case_data)
-            cases_found += 1
+            hearing = CourtCaseHearing(
+                case_number=case_number,
+                court_identifier=court_id,
+                hearing_date_bs=date_bs,
+                hearing_date_ad=convert_bs_to_ad(date_bs),
+                bench=bench_no_roman,
+                bench_type=bench_type,
+                judge_names=judge_name,
+                lawyer_names=lawyer_names,
+                serial_no=serial_no,
+                case_status=status,
+                remarks=remarks,
+                scraped_at=datetime.now(KATHMANDU_TZ).replace(tzinfo=None),
+                extra_data={
+                    'bench_id': bench_id,
+                    'bench_no': bench_no
+                }
+            )
+            
+            data.append((case, hearing))
         
-        self.logger.info(f"Saved {cases_found} cases for {court} - bench {bench_no} on {date_ad}")
+        return data
 
-    def save_case(self, case_data):
-        """Save case data to JSON file organized by court, registration date, and case number"""
-        court = case_data['court']
-        case_number = case_data['case_number']
-        date_bs = case_data['date_bs']
-        registration_date = case_data['registration_date']
+    def _save_cases_and_hearings(self, data: List[Tuple[CourtCase, CourtCaseHearing]], court_id: str, date_bs: str, bench_count: int):
+        with self.session.begin():
+            for case, hearing in data:
+                self.session.merge(case)
+                self.session.add(hearing)
+            
+            mark_date_scraped(self.session, court_id, date_bs, f"{bench_count} benches")
+
+    def _handle_bench_completion(self, court_id: str, date_bs: str, total_benches: int, new_data: List[Tuple[CourtCase, CourtCaseHearing]]):
+        key = (court_id, date_bs)
+        self._bench_counter[key] = self._bench_counter.get(key, 0) + 1
         
-        # Use registration date for directory organization
-        reg_date_dir = registration_date if registration_date else "unknown"
+        if self._bench_counter[key] >= total_benches:
+            all_data = self._data_by_date.get(key, [])
+            all_data.extend(new_data)
+            self._save_cases_and_hearings(all_data, court_id, date_bs, total_benches)
+            self.logger.info(f"Saved all cases for {court_id} on {date_bs}")
+            self._data_by_date.pop(key, None)
+        else:
+            if key not in self._data_by_date:
+                self._data_by_date[key] = []
+            self._data_by_date[key].extend(new_data)
+
+    def parse_cases(self, response):
+        soup = BeautifulSoup(response.text, 'html.parser')
         
-        # Sanitize case number for directory name
-        case_dir_name = case_number.replace('/', '-').replace('\\', '-').strip()
+        court_id = response.meta['court_id']
+        date_bs = response.meta['date_bs']
+        bench_id = response.meta['bench_id']
+        bench_no = response.meta['bench_no']
+        judge_name = response.meta['judge_name']
+        total_benches = response.meta['total_benches']
         
-        # Organize as: highcourts/<court>/<reg-date>/<case-number>/activity/<date>.json
-        case_dir = HIGH_COURT_DIR / court / reg_date_dir / case_dir_name / "activity"
-        filepath = case_dir / f"{date_bs}.json"
+        bench_type_elem = soup.find('h4', string=lambda x: x and 'इजलास' in x)
+        bench_type = normalize_whitespace(bench_type_elem.get_text()) if bench_type_elem else ""
         
-        # Skip if file already exists
-        if filepath.exists():
+        case_table = soup.find('table', class_='table table-bordered table-hover')
+        
+        if not case_table:
+            self.logger.warning(f"No case table found for {court_id} - bench {bench_no} on {date_bs}")
+            self._handle_bench_completion(court_id, date_bs, total_benches, [])
             return
         
-        # Create directory if it doesn't exist
-        filepath.parent.mkdir(parents=True, exist_ok=True)
+        rows = case_table.find('tbody').find_all('tr', class_='data_row') if case_table.find('tbody') else []
         
-        # Save to file
-        with open(filepath, 'w', encoding='utf-8') as f:
-            json.dump(case_data, f, ensure_ascii=False, indent=2)
+        if not rows:
+            self.logger.info(f"No cases found for {court_id} - bench {bench_no} on {date_bs}")
+            self._handle_bench_completion(court_id, date_bs, total_benches, [])
+            return
         
-        self.logger.info(f"Saved case: {case_number} for {court} on {date_bs}")
+        data = self._extract_case_data(rows, court_id, date_bs, bench_id, bench_no, bench_type, judge_name)
+        
+        self.logger.info(f"Extracted {len(data)} cases for {court_id} - bench {bench_no} on {date_bs}")
+        self._handle_bench_completion(court_id, date_bs, total_benches, data)
 
 
 if __name__ == "__main__":
     import sys
+    from scrapy.crawler import CrawlerProcess
     
-    # Allow running for specific court: python high_court_cases.py dhankutahc
     court = sys.argv[1] if len(sys.argv) > 1 else None
     
-    HIGH_COURT_DIR.mkdir(parents=True, exist_ok=True)
     process = CrawlerProcess({"LOG_LEVEL": "INFO"})
     process.crawl(HighCourtCasesSpider, court=court)
     process.start()
