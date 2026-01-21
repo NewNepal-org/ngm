@@ -112,9 +112,29 @@ class CourtCase(Base):
     priority = Column(String(400), nullable=True)
     # Example: "सरल" (simple/fast-track)
     
+    # Enriched case information (from detail page scraping)
+    registration_number = Column(String(100), nullable=True)
+    
+    case_status = Column(String(100), nullable=True, index=True)
+    # Example: "चालु", "फैसला भएको"
+    
+    verdict_date_bs = Column(String(20), nullable=True)
+    # BS format: "2082-09-28" or "**** ** **" if not available
+    
+    verdict_date_ad = Column(Date, nullable=True)
+    # AD format for queries
+    
+    verdict_judge = Column(String(500), nullable=True)
+    # Judge who gave the verdict
+    
     # Audit fields
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
+    
+    # Enrichment status
+    status = Column(String(20), nullable=True, default='pending', index=True)
+    # Values: "pending", "enriched", "failed"
+    # Tracks whether detailed case information has been scraped
     
     # Additional data (case-specific metadata)
     extra_data = Column(JSONB, nullable=True)
@@ -210,6 +230,53 @@ class CourtCaseHearing(Base):
         return f"<CourtCaseHearing(case_number={self.case_number}, hearing_date={self.hearing_date_bs})>"
 
 
+class CaseEntity(Base):
+    """
+    Case entities table storing plaintiff and defendant information.
+    
+    This table stores detailed party information extracted from case detail pages.
+    Each row represents one party (plaintiff or defendant) in a case.
+    """
+    __tablename__ = "court_case_entities"
+    
+    # Primary key
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    
+    # Foreign key to CourtCase (composite)
+    case_number = Column(String(50), nullable=False, index=True)
+    
+    court_identifier = Column(
+        String(50), 
+        ForeignKey('courts.identifier'), 
+        nullable=False, 
+        index=True
+    )
+    
+    # Relationship
+    court = relationship("Court", backref="case_entities")
+    
+    # Party information
+    side = Column(String(20), nullable=False, index=True)
+    # Values: "plaintiff", "defendant"
+    
+    name = Column(String(500), nullable=False)
+    # Party name (required)
+    
+    address = Column(String(500), nullable=True)
+    # Party address (optional)
+    
+    # External entity resolution
+    nes_id = Column(String(100), nullable=True, index=True)
+    # Nepal Entity Service ID for entity resolution
+    
+    # Audit fields
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
+    
+    def __repr__(self):
+        return f"<CaseEntity(case_number={self.case_number}, side={self.side}, name={self.name})>"
+
+
 # Indexes for performance
 Index('idx_court_type', Court.court_type)
 
@@ -246,6 +313,25 @@ Index('idx_hearing_judge_fts',
       CourtCaseHearing.judge_names, 
       postgresql_using='gin',
       postgresql_ops={'judge_names': 'gin_trgm_ops'})
+
+# Case entity indexes
+Index('idx_case_entity_case', 
+      CaseEntity.case_number, 
+      CaseEntity.court_identifier)
+
+Index('idx_case_entity_side', 
+      CaseEntity.side, 
+      CaseEntity.court_identifier)
+
+Index('idx_case_entity_name_fts', 
+      CaseEntity.name, 
+      postgresql_using='gin',
+      postgresql_ops={'name': 'gin_trgm_ops'})
+
+# Case status index for enrichment queries
+Index('idx_case_status_date', 
+      CourtCase.status, 
+      CourtCase.registration_date_ad.desc())
 
 
 class CourtScrapedDate(Base):

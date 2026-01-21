@@ -266,6 +266,7 @@ class HighCourtCasesSpider(scrapy.Spider):
             self._save_cases_and_hearings(all_data, court_id, date_bs, total_benches)
             self.logger.info(f"Saved all cases for {court_id} on {date_bs}")
             self._data_by_date.pop(key, None)
+            self._bench_counter.pop(key, None)  # Clean up counter
         else:
             if key not in self._data_by_date:
                 self._data_by_date[key] = []
@@ -302,14 +303,3 @@ class HighCourtCasesSpider(scrapy.Spider):
         
         self.logger.info(f"Extracted {len(data)} cases for {court_id} - bench {bench_no} on {date_bs}")
         self._handle_bench_completion(court_id, date_bs, total_benches, data)
-
-
-if __name__ == "__main__":
-    import sys
-    from scrapy.crawler import CrawlerProcess
-    
-    court = sys.argv[1] if len(sys.argv) > 1 else None
-    
-    process = CrawlerProcess({"LOG_LEVEL": "INFO"})
-    process.crawl(HighCourtCasesSpider, court=court)
-    process.start()

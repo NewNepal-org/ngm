@@ -32,6 +32,24 @@ def nepali_to_roman_numerals(text):
     return result
 
 
+def roman_to_nepali_numerals(text):
+    """Convert Roman numerals (ASCII digits) to Nepali numerals (Devanagari digits)"""
+    if not text:
+        return text
+    
+    # Mapping of Roman digits to Nepali digits
+    roman_to_nepali = {
+        '0': '०', '1': '१', '2': '२', '3': '३', '4': '४',
+        '5': '५', '6': '६', '7': '७', '8': '८', '9': '९'
+    }
+    
+    result = text
+    for roman, nepali in roman_to_nepali.items():
+        result = result.replace(roman, nepali)
+    
+    return result
+
+
 def normalize_date(date_str):
     """Normalize date format to use dashes and Roman numerals (e.g., २०८१/०९/२८ -> 2081-09-28)"""
     if not date_str:
