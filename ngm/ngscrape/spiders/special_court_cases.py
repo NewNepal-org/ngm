@@ -14,7 +14,7 @@ from ngm.utils.normalizer import (
 )
 from ngm.database.models import get_engine, get_session, init_db, CourtCase, CourtCaseHearing
 from ngm.utils.db_helpers import get_scraped_dates, mark_date_scraped, convert_bs_to_ad, CaseCache
-from ngm.ngscrape.constants import SCRAPE_LOOKBACK_DAYS, SCRAPE_OFFSET_DAYS
+from ngm.ngscrape.constants import SCRAPE_LOOKBACK_DAYS_SPECIAL_COURT, SCRAPE_OFFSET_DAYS
 
 COURT_ID = "special"
 KATHMANDU_TZ = pytz.timezone('Asia/Kathmandu')
@@ -45,7 +45,7 @@ class SpecialCourtCasesSpider(scrapy.Spider):
     def start_requests(self):
         now_ktm = datetime.now(KATHMANDU_TZ)
         end_date = now_ktm.date() - timedelta(days=SCRAPE_OFFSET_DAYS)
-        start_date = end_date - timedelta(days=SCRAPE_LOOKBACK_DAYS)
+        start_date = end_date - timedelta(days=SCRAPE_LOOKBACK_DAYS_SPECIAL_COURT)
         
         current_date = end_date
         while current_date >= start_date:
