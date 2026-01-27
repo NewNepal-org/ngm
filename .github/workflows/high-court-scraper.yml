@@ -2,8 +2,8 @@ name: High Court Cases Scraper
 
 on:
   schedule:
-    # Run daily at 4:00 AM UTC (9:45 AM Nepal Time)
-    - cron: '0 4 * * *'
+    # TEMPORARY: Run every 8 hours for backfilling (will revert to daily)
+    - cron: '32 1,9,17 * * *'
   workflow_dispatch: # Allow manual trigger
 
 jobs:
